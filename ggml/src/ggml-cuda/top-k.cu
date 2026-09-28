@@ -310,6 +310,15 @@ static void top_k_radix_cuda(
 
 #endif // Batched radix selection: CUDA with DeviceTopK, or HIP without CUB.
 
+// dst[r][0..k) = src[r][0..k): a kernel instead of cudaMemcpy2DAsync, which ROCm rejects with
+// "invalid argument" for some pool-allocated (VMM) buffers even when pitch and width are valid
+static __global__ void top_k_copy_rows(const int * __restrict__ src, int * __restrict__ dst, int ncols, int k) {
+    const int64_t row = blockIdx.x;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        dst[row * k + i] = src[row * ncols + i];
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -374,8 +383,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
         int *                     tmp_dst = temp_dst_alloc.get();
         argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
+        top_k_copy_rows<<<nrows, std::min<int>(k, 256), 0, stream>>>(tmp_dst, dst_d, ncols, k);
 #if defined(GGML_USE_HIP)
     }
 #endif // defined(GGML_USE_HIP)
