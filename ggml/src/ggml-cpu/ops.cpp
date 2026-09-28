@@ -1,3 +1,6 @@
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "ops.h"
 
 #include "ggml-cpu.h"
@@ -8589,6 +8592,41 @@ struct cmp_top_k {
     }
 };
 
+// value near rank ~1.5k of a strided sample: few enough candidates to sort cheaply, rarely fewer than k
+static float top_k_threshold(const float * data, int64_t n, int k, std::vector<float> & sample) {
+    const int64_t n_sample = std::min<int64_t>(n, 8192);
+    const int64_t step     = n / n_sample;
+    sample.resize(n_sample);
+    for (int64_t i = 0; i < n_sample; ++i) {
+        sample[i] = data[i*step];
+    }
+    const int64_t rank = std::min<int64_t>(n_sample - 1, (int64_t) k * n_sample / n * 3 / 2 + 16);
+    std::nth_element(sample.begin(), sample.begin() + rank, sample.end(), std::greater<float>());
+    return sample[rank];
+}
+
+// indices (ascending) of the elements >= thr
+static int64_t top_k_filter(const float * data, int64_t n, float thr, int32_t * out) {
+    int64_t m = 0;
+    int64_t j = 0;
+#if defined(__AVX2__)
+    const __m256 vthr = _mm256_set1_ps(thr);
+    for (; j + 8 <= n; j += 8) {
+        int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(data + j), vthr, _CMP_GE_OQ));
+        while (mask) {
+            out[m++] = (int32_t) (j + __builtin_ctz(mask));
+            mask &= mask - 1;
+        }
+    }
+#endif
+    for (; j < n; ++j) {
+        if (data[j] >= thr) {
+            out[m++] = (int32_t) j;
+        }
+    }
+    return m;
+}
+
 static void ggml_compute_forward_top_k_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
@@ -8610,6 +8648,7 @@ static void ggml_compute_forward_top_k_f32(
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
     std::vector<float> row_f32(src0->type == GGML_TYPE_F16 ? ne00 : 0);
+    std::vector<float> row_sample;
 
     for (int64_t i = ith; i < nr; i += nth) {
         const float * src_data = (float *)((char *) src0->data + i*nb01);
@@ -8618,11 +8657,22 @@ static void ggml_compute_forward_top_k_f32(
             src_data = row_f32.data();
         }
 
-        for (int64_t j = 0; j < ne00; j++) {
-            tmp[j] = j;
+        // Wide rows (e.g. the qwen4exp QSA router, k ~ 2k of up to 256k cells): keep only candidates at or above an
+        // estimated threshold with a vectorized compare, then sort those. Exact: everything excluded is below the
+        // threshold and ties at it are kept; falls back to sorting the whole row if too few candidates survive.
+        int64_t n_cand = 0;
+        if (ne00 >= 4096 && ne00 >= 8*(int64_t) top_k) {
+            const float thr = top_k_threshold(src_data, ne00, top_k, row_sample);
+            n_cand = top_k_filter(src_data, ne00, thr, tmp);
         }
-
-        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data, stable});
+        if (n_cand >= top_k) {
+            std::partial_sort(tmp, tmp + top_k, tmp + n_cand, cmp_top_k{src_data, stable});
+        } else {
+            for (int64_t j = 0; j < ne00; j++) {
+                tmp[j] = j;
+            }
+            std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data, stable});
+        }
 
         int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
 
@@ -8654,6 +8704,7 @@ void ggml_compute_forward_top_k_qsa(
 
     int32_t * tmp = (int32_t *) params->wdata + (n_kv + CACHE_LINE_SIZE_F32) * ith;
     std::vector<float> row(n_kv);
+    std::vector<float> row_sample;
 
     for (int64_t r = ith; r < nr; r += nth) {
         const int64_t s = r / n_tps;
@@ -8671,10 +8722,18 @@ void ggml_compute_forward_top_k_qsa(
             }
         }
 
-        for (int64_t j = 0; j < n_kv; ++j) {
-            tmp[j] = j;
+        int64_t n_cand = 0;
+        if (n_kv >= 4096 && n_kv >= 8*(int64_t) top_k) {
+            n_cand = top_k_filter(row.data(), n_kv, top_k_threshold(row.data(), n_kv, top_k, row_sample), tmp);
         }
-        std::partial_sort(tmp, tmp + top_k, tmp + n_kv, cmp_top_k{row.data(), false});
+        if (n_cand >= top_k) {
+            std::partial_sort(tmp, tmp + top_k, tmp + n_cand, cmp_top_k{row.data(), false});
+        } else {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                tmp[j] = j;
+            }
+            std::partial_sort(tmp, tmp + top_k, tmp + n_kv, cmp_top_k{row.data(), false});
+        }
         std::copy(tmp, tmp + top_k, (int32_t *) dst->data + r*top_k);
     }
 }
