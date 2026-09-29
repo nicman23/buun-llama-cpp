@@ -22323,6 +22323,20 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // Dynamic VBR sizes its KV tiers for every prompt token still to come: the rest of this batch
+        // plus the prompt tokens not yet batched, so a long prompt drops precision before prefill
+        // instead of running out of VRAM partway through
+        {
+            int64_t lookahead = batch.size() - off;
+            for (const auto & slot : slots) {
+                if ((slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) && slot.task) {
+                    lookahead += std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens());
+                }
+            }
+            llama_memory_vbr_set_lookahead(llama_get_memory(ctx_tgt),
+                    (uint32_t) std::min<int64_t>(lookahead, UINT32_MAX));
+        }
+
         // Keep target verification and the dependent speculative update inside
         // one queue yield. Re-arming the worker between these two operations
         // adds a second mutex/wake/condition rendezvous to every speculative

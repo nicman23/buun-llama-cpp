@@ -100,6 +100,9 @@ public:
     void vbr_commit_submitted() override {
         mem_attn->vbr_commit_submitted();
     }
+    void vbr_set_lookahead(uint32_t n_tokens) override {
+        mem_attn->vbr_set_lookahead(n_tokens);
+    }
     void vbr_decode_ops_finish(bool ok) override {
         mem_attn->vbr_decode_ops_finish(ok);
     }

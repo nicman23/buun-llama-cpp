@@ -315,6 +315,10 @@ struct llama_memory_i {
     // Promote deferred (submitted) extent entries at the context's existing synchronize
     // boundary. Inert for non-VBR memories; composites forward to their attention child.
     virtual void vbr_commit_submitted() {}
+    // tokens still to be decoded for the prompts being prefilled, counting the next batch (0 = none):
+    // dynamic VBR sizes its degrade decisions for all of them, so a prompt that would not fit at the
+    // current tiers drops precision before its rows are written instead of running out of VRAM mid-prefill
+    virtual void vbr_set_lookahead(uint32_t /*n_tokens*/) {}
     // Resolve in-flight decode operations once the decode outcome is known.
     virtual void vbr_decode_ops_finish(bool /*ok*/) {}
     // Composite wrappers mint one operation per logical mutation and adopt

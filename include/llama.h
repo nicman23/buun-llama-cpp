@@ -972,6 +972,12 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Dynamic VBR: prompt tokens still to be decoded, counting the next llama_decode batch (0 = none).
+    // Set before each prefill batch so the KV tiers are chosen for the whole remaining prompt and a
+    // prompt that would exhaust VRAM at the current precision drops precision before its rows are
+    // written. No effect on memory without dynamic VBR.
+    LLAMA_API void llama_memory_vbr_set_lookahead(llama_memory_t mem, uint32_t n_tokens);
+
     // effective bits/value of the attention KV cache at its CURRENT tensor types, aggregated
     // over all KV layers (f16 = 16, q8_0 = 8.5, turbo tiers struct-true). Under dynamic VBR
     // this moves at runtime as tiers degrade/reset. Returns -1 when the context's memory

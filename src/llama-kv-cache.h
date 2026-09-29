@@ -320,6 +320,7 @@ public:
     llama_memory_vbr_preflight_data vbr_retier_preflight(
         uint32_t n_tokens_extra,
         std::vector<llama_memory_vbr_physical_growth> * physical = nullptr) const override;
+    void vbr_set_lookahead(uint32_t n_tokens) override { vbr_lookahead_ = n_tokens; }
     bool vbr_retier_freeze_active() const {
         return other ? other->vbr_retier_freeze_active() : vbr_retier_freeze_depth_ > 0;
     }
@@ -1279,6 +1280,7 @@ private:
     // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
     uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
     uint32_t vbr_last_wm_          = 0;   // predicted padded watermark of last successful boundary
+    uint32_t vbr_lookahead_        = 0;   // prompt tokens still to prefill, incl. the next batch (vbr_set_lookahead)
     void     vbr_rederive_budget();
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)

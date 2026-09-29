@@ -944,6 +944,11 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa()  const {
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
 }
 
+void llama_kv_cache_iswa::vbr_set_lookahead(uint32_t n_tokens) {
+    kv_base->vbr_set_lookahead(n_tokens);
+    kv_swa ->vbr_set_lookahead(n_tokens);
+}
+
 void llama_kv_cache_iswa::vbr_commit_submitted() {
     kv_base->vbr_commit_submitted();
     kv_swa ->vbr_commit_submitted();
