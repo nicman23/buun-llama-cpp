@@ -3155,13 +3155,19 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // cells at all after sequence redistribution). Consume each decrease exactly once: using a
         // pool's grow-only wm_cells here would keep the full path hot until the 25% shrink threshold.
         const uint32_t wm_next = vbr_watermark_cells(n_tokens);
+        // Tier decisions also cover the prompt tokens still to come (vbr_set_lookahead): a long prompt
+        // that will not fit at the current tiers degrades now, while its rows are unwritten (the first
+        // batch of a fresh prompt meets an empty cache, so the degrade has nothing to transcode),
+        // instead of mapping f16 rows until the device runs out mid-prefill. Physical mapping below
+        // still grows only to this batch's watermark.
+        const uint32_t wm_plan = std::max(wm_next, vbr_watermark_cells(std::max(n_tokens, vbr_lookahead_)));
         const bool wm_receded = wm_next < vbr_last_wm_;
         const bool reset_due = vbr_degrade_cursor_ > 0 && used_now == 0;
         bool vbr_stable = (vbr_retier_freeze_depth_ == 0 && !vbr_reconcile_now &&
                            vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
-                           !wm_receded && !reset_due &&
+                           !wm_receded && !reset_due && wm_plan == wm_next &&
                            !vbr_tree_forced());
 
         if (!vbr_stable) {
@@ -3198,20 +3204,20 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             vbr_quiet_boundaries_++;
             // co-tenancy: promotes freeze while any unamortized grant remains, and around
             // presence changes (gates live in vbr_maybe_promote)
-            vbr_maybe_promote(wm_next);
+            vbr_maybe_promote(wm_plan);
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
             // that owns its tensor, but the cursor is a global price order — advancing it while any
             // pool is over budget is the simplest rule that terminates and preserves the price order.
             // Pre-loop pressure snapshot: the runtime demand's honest ask is what
             // this boundary was short BEFORE the own ladder's sacrifice resolved it
-            const bool vbr_was_over = vbr_over_budget(wm_next);
+            const bool vbr_was_over = vbr_over_budget(wm_plan);
             vbr_runtime_was_over_ = vbr_was_over;
             if (vbr_was_over) {
                 vbr_pre_deficit_.assign(vbr_pools_.size(), 0);
                 for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
                     const auto & pp = vbr_pools_[pi];
                     if (pp.vmm != nullptr) {
-                        const size_t proj = vbr_vmm_projected_bytes(pp, wm_next);
+                        const size_t proj = vbr_vmm_projected_bytes(pp, wm_plan);
                         const size_t be   = vbr_budget_eff(pp);
                         vbr_pre_deficit_[pi] = proj > be ? proj - be : 0;
                     }
@@ -3223,9 +3229,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 // past its declared bound. Never interpret "frozen" as ladder exhaustion.
                 vbr_retier_defer("degrade_pressure");
             } else {
-                while (vbr_over_budget(wm_next)) {
+                while (vbr_over_budget(wm_plan)) {
                     vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
-                    const vbr_degrade_result degrade = vbr_degrade_next(wm_next);
+                    const vbr_degrade_result degrade = vbr_degrade_next(wm_plan);
                     if (degrade == vbr_degrade_result::reserve_failed) {
                         LLAMA_LOG_ERROR("%s: VBR component reserve failed before tier mutation — "
                                 "failing this batch recoverably\n", __func__);
@@ -3256,12 +3262,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                             vbr_budget_warned_ = true;
                             size_t projected_total = 0;
                             for (const auto & p : vbr_pools_) {
-                                projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_next) : 0;
+                                projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_plan) : 0;
                             }
                             LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
                                     __func__, vbr_budget_bytes_/1024.0/1024.0,
                                     vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
-                                    projected_total/1024.0/1024.0, wm_next);
+                                    projected_total/1024.0/1024.0, wm_plan);
                         }
                         break;
                     }
@@ -4323,9 +4329,12 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
         // free -> budget_eff collapsed to mapped (4 MiB) against a 68 MiB need and the first
         // boundary cascaded all 71 clamped steps to the floor.
         const size_t grow_room = p.budget > mapped_now ? p.budget - mapped_now : 0;
+        // Auto budgets keep the growth headroom free too (the free-VRAM cutoff): the compute buffer
+        // grows with the KV length and ops take pool scratch after this boundary's map, so a pool
+        // allowed to map down to the ledger headroom leaves the next graph nothing to allocate.
         const size_t own_headroom = vbr_budget_explicit_
                 ? std::max(std::min(vbr_growth_headroom_, grow_room), ledger_headroom)
-                : ledger_headroom;
+                : std::max(vbr_growth_headroom_, ledger_headroom);
         const size_t headroom_eff = own_headroom + ledger_headroom * (n_live - 1);
         if (n_live > 1) {
             constexpr size_t quantum = 64ull * 1024 * 1024;

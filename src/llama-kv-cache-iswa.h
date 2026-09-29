@@ -123,6 +123,7 @@ public:
     bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
     void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
     void vbr_commit_submitted() override;
+    void vbr_set_lookahead(uint32_t n_tokens) override;
     void vbr_decode_ops_finish(bool ok) override;
     void vbr_adopt_operation(vbr_operation_id operation_id) override;
     void vbr_release_adopted() override;
