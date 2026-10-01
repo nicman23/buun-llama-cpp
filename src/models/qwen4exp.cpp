@@ -1010,10 +1010,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // One head at a time, rectified and accumulated in place: the scores are n_kv/ratio blocks wide per token, so
     // all heads at once would hold n_idx_h times that (= n_kv floats per token at ratio 4) in the compute buffer.
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s.
+    // Heads outermost once ([idx_dim, n_tokens, n_idx_h], small), so each head is a contiguous slice.
+    ggml_tensor * q_heads = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
     ggml_tensor * score = nullptr;
     for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * q_h = ggml_cont(ctx0, ggml_view_3d(ctx0, q, idx_dim, n_tps, n_stream,
-                q->nb[2], q->nb[2]*n_tps, h*q->nb[1]));
+        ggml_tensor * q_h = ggml_reshape_3d(ctx0,
+                ggml_view_1d(ctx0, q_heads, idx_dim*n_tokens, h*q_heads->nb[2]), idx_dim, n_tps, n_stream);
         ggml_tensor * s_h = ggml_relu_inplace(ctx0, ggml_mul_mat(ctx0, pooled, q_h));
         score = score ? ggml_add_inplace(ctx0, score, s_h) : s_h;
     }

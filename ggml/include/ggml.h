@@ -2641,7 +2641,7 @@ extern "C" {
     // n_kv x n_tokens cell values. Per token, block b has the value score[b] + bias[b], where bias[b] is
     // blk_bias[b, 1] for b >= blk_thr[token], else blk_bias[b, 0]. A block of value >= 5e8 is forced: its
     // cells that the token can see (finite mask) come first. Then the (k - (r - 1))/r best blocks of finite
-    // value, r = blk_cells->ne[0]/n_blocks, expanded to all r of their cells. Slots left over hold cells the
+    // value (rounded down), r = blk_cells->ne[0]/n_blocks, expanded to all r of their cells. Slots left over hold cells the
     // mask hides from the token, so they add nothing to the attention.
     //   score:     [n_blocks,   n_tps, n_stream]     f32
     //   cell_blk:  [n_kv,       n_stream]            i32, block of each cell, in [0, n_blocks)

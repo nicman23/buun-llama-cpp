@@ -5920,7 +5920,7 @@ struct ggml_tensor * ggml_top_k_qsa(
     GGML_ASSERT(blk_cells->type == GGML_TYPE_I32 && ggml_is_contiguous(blk_cells) && blk_cells->ne[1] == n_stream);
     const int64_t r = blk_cells->ne[0]/score->ne[0];
     GGML_ASSERT(r > 0 && blk_cells->ne[0] == r*score->ne[0]);
-    GGML_ASSERT(k >= r - 1 && (k - (r - 1)) % r == 0 && (k - (r - 1))/r <= score->ne[0]);
+    GGML_ASSERT(k >= r - 1 && (k - (r - 1))/r <= score->ne[0]); // floor(budget/r) blocks, as the reference
     GGML_ASSERT(k > 0 && k <= n_kv);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k, n_tps, n_stream);

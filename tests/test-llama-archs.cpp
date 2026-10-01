@@ -1086,8 +1086,10 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
         ggml_tensor * cell_blk = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, n_kv, 1);
         ggml_tensor * blk_cells = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, ratio*n_blocks, 1);
         ggml_tensor * blk_pos = ggml_new_tensor_1d(tensor_ctx.get(), GGML_TYPE_I32, 4*n_blocks);
+        // blk_bias: the two sides of each block's bias and the query's step between them
         ggml_tensor * bias = ggml_new_tensor_3d(
-                tensor_ctx.get(), GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, 1, 1);
+                tensor_ctx.get(), GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, blk_bias ? 2 : 1, 1);
+        ggml_tensor * blk_thr = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, 1, 1);
         ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
         GGML_ASSERT(cpu != nullptr);
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(tensor_ctx.get(), cpu.get()));
@@ -1102,15 +1104,23 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
             true, 1, 1, 1, 1, (uint32_t) query_pos.size(), &token, nullptr, mutable_query_pos.data(),
             &n_seq_id, &seq_ids, &seq, nullptr, &output, {},
         };
-        qsa.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, &query, ratio, blk_bias, true);
+        qsa.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_thr, &query, ratio, blk_bias, true);
+
+        // the query's effective bias: per block for blk_bias, per cell otherwise
+        std::vector<float> eff((float *) bias->data, (float *) bias->data + (blk_bias ? n_blocks : n_kv));
+        if (blk_bias) {
+            const int32_t thr = *(const int32_t *) blk_thr->data;
+            for (int64_t b = thr; b < n_blocks; ++b) {
+                eff[b] = ((const float *) bias->data)[n_blocks + b];
+            }
+        }
 
         layout_result result {
             n_kv, n_blocks,
             std::vector<int32_t>((int32_t *) cell_blk->data, (int32_t *) cell_blk->data + n_kv),
             std::vector<int32_t>((int32_t *) blk_cells->data, (int32_t *) blk_cells->data + ratio*n_blocks),
             std::vector<int32_t>((int32_t *) blk_pos->data, (int32_t *) blk_pos->data + 4*n_blocks),
-            std::vector<float>((float *) bias->data,
-                               (float *) bias->data + (blk_bias ? n_blocks : n_kv)),
+            eff,
         };
         return result;
     };
