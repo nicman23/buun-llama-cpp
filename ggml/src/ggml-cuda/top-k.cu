@@ -326,18 +326,22 @@ static void top_k_radix_cuda(
     top_k_radix_cuda_ld(pool, top_k_load_plain<T>{src, ncols}, dst, ncols, nrows, k, stream);
 }
 
-// qwen4exp QSA router: cell value = score[block of cell] + mask[cell]; rows are (token, stream)
+// qwen4exp QSA router: cell value = score[b] + bias[b] + mask[cell], b = block of cell; rows are (token, stream)
 template<typename M>
 struct top_k_load_qsa {
     const float   * score;    // [n_blocks, n_tps, n_stream]
     const int32_t * cell_blk; // [n_kv, n_stream]
     const M       * mask;     // [n_kv, n_tps, 1, n_stream]
+    const float   * blk_bias; // [n_blocks, 2, n_stream]: below / at or above the token's threshold
+    const int32_t * blk_thr;  // [n_tps, n_stream]
     int n_kv;
     int n_blocks;
     int n_tps;
     __device__ __forceinline__ float operator()(int row, int col) const {
         const int s = row / n_tps;
-        return score[(size_t) row * n_blocks + cell_blk[(size_t) s * n_kv + col]] + (float) mask[(size_t) row * n_kv + col];
+        const int b = cell_blk[(size_t) s * n_kv + col];
+        const float bias = blk_bias[((size_t) s * 2 + (b >= blk_thr[row])) * n_blocks + b];
+        return (score[(size_t) row * n_blocks + b] + bias) + (float) mask[(size_t) row * n_kv + col];
     }
 };
 
@@ -345,6 +349,8 @@ void ggml_cuda_op_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const ggml_tensor * score    = dst->src[0];
     const ggml_tensor * cell_blk = dst->src[1];
     const ggml_tensor * mask     = dst->src[2];
+    const float   * blk_bias = (const float   *) dst->src[3]->data;
+    const int32_t * blk_thr  = (const int32_t *) dst->src[4]->data;
 
     const int n_kv     = (int) cell_blk->ne[0];
     const int n_blocks = (int) score->ne[0];
@@ -354,11 +360,11 @@ void ggml_cuda_op_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     if (mask->type == GGML_TYPE_F16) {
         const top_k_load_qsa<half> ld{(const float *) score->data, (const int32_t *) cell_blk->data,
-                                      (const half *) mask->data, n_kv, n_blocks, n_tps};
+                                      (const half *) mask->data, blk_bias, blk_thr, n_kv, n_blocks, n_tps};
         top_k_radix_cuda_ld(ctx.pool(), ld, (int *) dst->data, n_kv, nrows, k, ctx.stream());
     } else {
         const top_k_load_qsa<float> ld{(const float *) score->data, (const int32_t *) cell_blk->data,
-                                       (const float *) mask->data, n_kv, n_blocks, n_tps};
+                                       (const float *) mask->data, blk_bias, blk_thr, n_kv, n_blocks, n_tps};
         top_k_radix_cuda_ld(ctx.pool(), ld, (int *) dst->data, n_kv, nrows, k, ctx.stream());
     }
 }

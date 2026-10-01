@@ -159,7 +159,7 @@ public:
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, ggml_tensor * blk_thr, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
 
 private:

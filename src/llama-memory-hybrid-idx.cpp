@@ -487,6 +487,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * blk_thr,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
@@ -511,6 +512,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
+    int32_t * dst_blk_thr   = blk_bias ? (int32_t *) blk_thr->data : nullptr;
 
     GGML_ASSERT(r <= 64);
     GGML_ASSERT(r*n_blocks >= n_kv);
@@ -693,6 +695,31 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const bool have_dead = !direct && n_bid < n_blocks;
         const int32_t dead_bid = have_dead ? n_bid : n_blocks - 1;
 
+        // blk_bias: a token's bias over the blocks is a step at its causal tail. Below the step a valid
+        // block keeps 0 (complete) or -inf (an old incomplete block); from the step on it is forced (1e9).
+        // Valid blocks start at non-decreasing positions in every layout, so the step is one block index.
+        if (blk_bias) {
+            float * lo = dst_bias + s*2*n_blocks;
+            float * hi = lo + n_blocks;
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                const int32_t rep = direct ? pos_at(1, b) : 0;
+                if (b >= n_bid || rep < 0 || (direct && !cells.seq_has((uint32_t) rep, seq_of_stream))) {
+                    lo[b] = hi[b] = -INFINITY;
+                    continue;
+                }
+                const bool incomplete = direct && pos_at(2, b) == 0;
+                if (!causal_attn) {
+                    lo[b] = hi[b] = incomplete ? 1e9f : 0.0f;
+                } else {
+                    lo[b] = incomplete ? -INFINITY : 0.0f;
+                    hi[b] = 1e9f;
+                }
+            }
+            if (have_dead) {
+                lo[dead_bid] = hi[dead_bid] = 1e9f;
+            }
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -739,26 +766,20 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             const int64_t tail_start = (q + 1)/r*r;
 
             if (blk_bias) {
-                float * cur_blk_bias = dst_bias + i*n_blocks;
-
-                for (int64_t b = 0; b < n_blocks; ++b) {
-                    const int32_t rep = direct ? pos_at(1, b) : 0;
-                    if (b >= n_bid || rep < 0 ||
-                        (direct && !cells.seq_has((uint32_t) rep, seq_id))) {
-                        cur_blk_bias[b] = -INFINITY;
-                        continue;
+                // one logical sequence per stream (qsa_selection_safe), so block validity is per stream
+                GGML_ASSERT(seq_id == seq_of_stream);
+                // the first valid block that starts at or after the tail
+                int64_t lo_b = 0, hi_b = n_bid;
+                while (lo_b < hi_b) {
+                    const int64_t mid = (lo_b + hi_b)/2;
+                    const int64_t block_start = query_ranked ? mid*r : pos_at(0, mid);
+                    if (block_start >= tail_start) {
+                        hi_b = mid;
+                    } else {
+                        lo_b = mid + 1;
                     }
-
-                    const int64_t block_start = query_ranked ? b*r : pos_at(0, b);
-                    const bool incomplete = direct && pos_at(2, b) == 0;
-                    cur_blk_bias[b] = !causal_attn ? (incomplete ? 1e9f : 0.0f) :
-                        (block_start >= tail_start ? 1e9f : (incomplete ? -INFINITY : 0.0f));
                 }
-
-                if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
-                }
-
+                dst_blk_thr[i] = (int32_t) lo_b;
                 continue;
             }
 

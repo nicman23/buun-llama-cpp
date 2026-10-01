@@ -8692,6 +8692,8 @@ void ggml_compute_forward_top_k_qsa(
     const ggml_tensor * score    = dst->src[0]; // [n_blocks, n_tps, n_stream] f32
     const ggml_tensor * cell_blk = dst->src[1]; // [n_kv, n_stream] i32
     const ggml_tensor * mask     = dst->src[2]; // [n_kv, n_tps, 1, n_stream] f16/f32
+    const ggml_tensor * blk_bias = dst->src[3]; // [n_blocks, 2, n_stream] f32
+    const ggml_tensor * blk_thr  = dst->src[4]; // [n_tps, n_stream] i32
 
     const int64_t n_blocks = score->ne[0];
     const int64_t n_tps    = score->ne[1];
@@ -8705,11 +8707,17 @@ void ggml_compute_forward_top_k_qsa(
     int32_t * tmp = (int32_t *) params->wdata + (n_kv + CACHE_LINE_SIZE_F32) * ith;
     std::vector<float> row(n_kv);
     std::vector<float> row_sample;
+    std::vector<float> sc(n_blocks);
 
     for (int64_t r = ith; r < nr; r += nth) {
         const int64_t s = r / n_tps;
-        const float   * sc  = (const float   *) score->data + r*n_blocks;
-        const int32_t * blk = (const int32_t *) cell_blk->data + s*n_kv;
+        const float   * sc_raw = (const float *) score->data + r*n_blocks;
+        const float   * bias   = (const float *) blk_bias->data + s*2*n_blocks;
+        const int32_t   thr    = ((const int32_t *) blk_thr->data)[r];
+        const int32_t * blk    = (const int32_t *) cell_blk->data + s*n_kv;
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            sc[b] = sc_raw[b] + bias[(b >= thr)*n_blocks + b];
+        }
         if (mask->type == GGML_TYPE_F16) {
             const ggml_fp16_t * m = (const ggml_fp16_t *) mask->data + r*n_kv;
             for (int64_t j = 0; j < n_kv; ++j) {

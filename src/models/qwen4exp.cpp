@@ -812,7 +812,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         if (selection_required) {
-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_thr, ubatch, ratio, blk_bias, causal_attn);
         }
     }
 
@@ -844,8 +844,13 @@ public:
             res &= cell_blk->ne[1]  == n_stream;
             res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
             res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
-            res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-            res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+            if (blk_bias) {
+                res &= bias->ne[0]    == n_blocks;
+                res &= blk_thr->ne[0] == params.ubatch.n_tokens/n_stream;
+            } else {
+                res &= bias->ne[0]    == n_kv;
+                res &= bias->ne[1]    == params.ubatch.n_tokens/n_stream;
+            }
         }
 
         return res;
@@ -856,7 +861,10 @@ public:
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
-    ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    // blk_bias: F32 [n_blocks, 2, n_stream], a block's bias below / at or above a token's blk_thr
+    // otherwise: F32 [n_kv, n_tokens/n_stream, n_stream], per cell and token
+    ggml_tensor * bias      = nullptr;
+    ggml_tensor * blk_thr   = nullptr;   // I32 [n_tokens/n_stream, n_stream], blk_bias only
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -923,7 +931,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
             qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
             qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            if (blk_bias) {
+                // a token's per-block bias is a step at its causal tail, so upload the two sides and the step
+                qsa->bias    = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blocks, 2, n_stream);
+                qsa->blk_thr = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps, n_stream);
+                ggml_set_input(qsa->blk_thr);
+            } else {
+                qsa->bias    = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tps, n_stream);
+            }
 
             ggml_set_input(qsa->cell_blk);
             ggml_set_input(qsa->blk_cells);
@@ -1009,13 +1024,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     ggml_tensor * top_k;
     if (blk_bias) {
-        // one value per block, so it is cheaper to bias here than after the cells are expanded
-        // (not in place: the bias is a host-side graph input)
-        score = ggml_add(ctx0, score, inp->bias);
         // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block
-        // boundary. The fused op reads score[cell_blk[cell]] + mask[cell] as it selects, so the n_kv x n_tokens
-        // cell values (the largest tensors of the long-context compute buffer) are never materialized.
-        top_k = ggml_top_k_qsa(ctx0, score, inp->cell_blk, kq_mask, width);
+        // boundary. The fused op reads score[b] + bias[b] + mask[cell] as it selects, so neither the
+        // n_kv x n_tokens cell values (the largest tensors of the long-context compute buffer) nor the
+        // n_blocks x n_tokens bias are materialized.
+        top_k = ggml_top_k_qsa(ctx0, score, inp->cell_blk, kq_mask, inp->bias, inp->blk_thr, width);
     } else {
         ggml_tensor * expanded = ggml_get_rows(ctx0,
                 ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);

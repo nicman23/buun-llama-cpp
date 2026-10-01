@@ -5900,8 +5900,11 @@ struct ggml_tensor * ggml_top_k_qsa(
         struct ggml_tensor  * score,
         struct ggml_tensor  * cell_blk,
         struct ggml_tensor  * mask,
+        struct ggml_tensor  * blk_bias,
+        struct ggml_tensor  * blk_thr,
         int                   k) {
     GGML_ASSERT(score->type == GGML_TYPE_F32 && cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(blk_bias->type == GGML_TYPE_F32 && blk_thr->type == GGML_TYPE_I32);
     GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(score) && ggml_is_contiguous(cell_blk) && ggml_is_contiguous(mask));
 
@@ -5910,6 +5913,9 @@ struct ggml_tensor * ggml_top_k_qsa(
     const int64_t n_stream = score->ne[2];
     GGML_ASSERT(score->ne[3] == 1 && cell_blk->ne[1] == n_stream && cell_blk->ne[2] == 1 && cell_blk->ne[3] == 1);
     GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[1] == n_tps && mask->ne[2] == 1 && mask->ne[3] == n_stream);
+    GGML_ASSERT(ggml_is_contiguous(blk_bias) && ggml_is_contiguous(blk_thr));
+    GGML_ASSERT(blk_bias->ne[0] == score->ne[0] && blk_bias->ne[1] == 2 && blk_bias->ne[2] == n_stream);
+    GGML_ASSERT(blk_thr->ne[0] == n_tps && blk_thr->ne[1] == n_stream);
     GGML_ASSERT(k > 0 && k <= n_kv);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k, n_tps, n_stream);
@@ -5918,6 +5924,8 @@ struct ggml_tensor * ggml_top_k_qsa(
     result->src[0] = score;
     result->src[1] = cell_blk;
     result->src[2] = mask;
+    result->src[3] = blk_bias;
+    result->src[4] = blk_thr;
 
     return result;
 }

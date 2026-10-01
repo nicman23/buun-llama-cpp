@@ -8558,6 +8558,8 @@ struct test_top_k_qsa_op : public test_case {
     ggml_tensor * score {};
     ggml_tensor * cell_blk {};
     ggml_tensor * mask {};
+    ggml_tensor * blk_bias {};
+    ggml_tensor * blk_thr {};
 
     std::string vars() override {
         return VARS_TO_STR6(n_kv, n_tps, n_stream, k, mask_type, shuffled);
@@ -8577,10 +8579,14 @@ struct test_top_k_qsa_op : public test_case {
         score    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
         cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
         mask     = ggml_new_tensor_4d(ctx, mask_type, n_kv, n_tps, 1, n_stream);
+        blk_bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 2, n_stream);
+        blk_thr  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tps, n_stream);
         ggml_set_name(score, "score");
         ggml_set_name(cell_blk, "cell_blk");
         ggml_set_name(mask, "mask");
-        ggml_tensor * out = ggml_top_k_qsa(ctx, score, cell_blk, mask, k);
+        ggml_set_name(blk_bias, "blk_bias");
+        ggml_set_name(blk_thr, "blk_thr");
+        ggml_tensor * out = ggml_top_k_qsa(ctx, score, cell_blk, mask, blk_bias, blk_thr, k);
         ggml_set_name(out, "out");
         return out;
     }
@@ -8615,6 +8621,22 @@ struct test_top_k_qsa_op : public test_case {
                 ggml_backend_tensor_set(mask, v.data(), 0, ggml_nbytes(mask));
             }
         }
+        {
+            // the router's bias: 0 or -inf below a token's step, forced (1e9) or -inf from it on
+            std::uniform_int_distribution<int> d(0, 9);
+            std::vector<float> v(ggml_nelements(blk_bias));
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t b = 0; b < n_blocks; ++b) {
+                    v[(s*2 + 0)*n_blocks + b] = d(rng) == 0 ? -INFINITY : 0.0f;
+                    v[(s*2 + 1)*n_blocks + b] = d(rng) == 0 ? -INFINITY : 1e9f;
+                }
+            }
+            ggml_backend_tensor_set(blk_bias, v.data(), 0, ggml_nbytes(blk_bias));
+            std::uniform_int_distribution<int> t(0, 8);
+            std::vector<int32_t> thr(ggml_nelements(blk_thr));
+            for (auto & x : thr) x = (int32_t) (n_blocks - t(rng));
+            ggml_backend_tensor_set(blk_thr, thr.data(), 0, ggml_nbytes(blk_thr));
+        }
     }
 
     double err(const float * a, const float * b, size_t n) override {
@@ -8626,6 +8648,10 @@ struct test_top_k_qsa_op : public test_case {
         std::vector<float> m(ggml_nelements(mask));
         ggml_backend_tensor_get(score, sc.data(), 0, ggml_nbytes(score));
         ggml_backend_tensor_get(cell_blk, cb.data(), 0, ggml_nbytes(cell_blk));
+        std::vector<float> bb(ggml_nelements(blk_bias));
+        std::vector<int32_t> th(ggml_nelements(blk_thr));
+        ggml_backend_tensor_get(blk_bias, bb.data(), 0, ggml_nbytes(blk_bias));
+        ggml_backend_tensor_get(blk_thr, th.data(), 0, ggml_nbytes(blk_thr));
         if (mask_type == GGML_TYPE_F16) {
             std::vector<ggml_fp16_t> h(m.size());
             ggml_backend_tensor_get(mask, h.data(), 0, ggml_nbytes(mask));
@@ -8635,7 +8661,8 @@ struct test_top_k_qsa_op : public test_case {
         }
         auto value = [&](int64_t r, int32_t c) {
             const int64_t s = r / n_tps;
-            return sc[r * n_blocks + cb[s * n_kv + c]] + m[r * n_kv + c];
+            const int32_t blk = cb[s * n_kv + c];
+            return (sc[r * n_blocks + blk] + bb[(s * 2 + (blk >= th[r])) * n_blocks + blk]) + m[r * n_kv + c];
         };
         double diff = 0.0;
         std::vector<float> va(k), vb(k);
