@@ -8609,8 +8609,14 @@ static void ggml_compute_forward_top_k_f32(
 
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
+    std::vector<float> row_f32(src0->type == GGML_TYPE_F16 ? ne00 : 0);
+
     for (int64_t i = ith; i < nr; i += nth) {
         const float * src_data = (float *)((char *) src0->data + i*nb01);
+        if (src0->type == GGML_TYPE_F16) {
+            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) ((char *) src0->data + i*nb01), row_f32.data(), ne00);
+            src_data = row_f32.data();
+        }
 
         for (int64_t j = 0; j < ne00; j++) {
             tmp[j] = j;
@@ -8629,6 +8635,50 @@ static void ggml_compute_forward_top_k_f32(
     }
 }
 
+void ggml_compute_forward_top_k_qsa(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * score    = dst->src[0]; // [n_blocks, n_tps, n_stream] f32
+    const ggml_tensor * cell_blk = dst->src[1]; // [n_kv, n_stream] i32
+    const ggml_tensor * mask     = dst->src[2]; // [n_kv, n_tps, 1, n_stream] f16/f32
+
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t nr       = n_tps*score->ne[2];
+    const int     top_k    = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    int32_t * tmp = (int32_t *) params->wdata + (n_kv + CACHE_LINE_SIZE_F32) * ith;
+    std::vector<float> row(n_kv);
+
+    for (int64_t r = ith; r < nr; r += nth) {
+        const int64_t s = r / n_tps;
+        const float   * sc  = (const float   *) score->data + r*n_blocks;
+        const int32_t * blk = (const int32_t *) cell_blk->data + s*n_kv;
+        if (mask->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * m = (const ggml_fp16_t *) mask->data + r*n_kv;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                row[j] = sc[blk[j]] + GGML_CPU_FP16_TO_FP32(m[j]);
+            }
+        } else {
+            const float * m = (const float *) mask->data + r*n_kv;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                row[j] = sc[blk[j]] + m[j];
+            }
+        }
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            tmp[j] = j;
+        }
+        std::partial_sort(tmp, tmp + top_k, tmp + n_kv, cmp_top_k{row.data(), false});
+        std::copy(tmp, tmp + top_k, (int32_t *) dst->data + r*top_k);
+    }
+}
+
 void ggml_compute_forward_top_k(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
@@ -8637,6 +8687,7 @@ void ggml_compute_forward_top_k(
 
     switch (src0->type) {
         case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
             {
                 ggml_compute_forward_top_k_f32(params, dst);
             } break;

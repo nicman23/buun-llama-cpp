@@ -1,4 +1,5 @@
 #include "argsort.cuh"
+#include "convert.cuh"
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
@@ -148,7 +149,8 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if defined(CUB_TOP_K_AVAILABLE) || (!defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP))
+// Batched radix selection. Values come from a loader, ld(row, col) -> float, so callers that compute a
+// cell's value on the fly (top_k_qsa) never materialize the row.
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -171,9 +173,9 @@ static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, i
     }
 }
 
-template<int BLOCK_SIZE, int RADIX_BITS>
+template<int BLOCK_SIZE, int RADIX_BITS, typename Loader>
 static __global__ void top_k_radix_histogram(
-        const float * __restrict__ src,
+        const Loader ld,
         const top_k_radix_state * __restrict__ states,
         int * __restrict__ block_histograms,
         int ncols,
@@ -184,7 +186,6 @@ static __global__ void top_k_radix_histogram(
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
-    const float * row_src = src + (size_t) row * ncols;
     __shared__ int histogram[NBINS];
 
     histogram[tid] = 0;
@@ -194,7 +195,7 @@ static __global__ void top_k_radix_histogram(
     for (int col = row_block * BLOCK_SIZE + tid;
          col < ncols;
          col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        const uint32_t key = top_k_float_to_ordered(ld(row, col));
         if ((key & state.prefix_mask) == state.prefix) {
             atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
         }
@@ -246,9 +247,9 @@ static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, in
     }
 }
 
-template<int BLOCK_SIZE>
+template<int BLOCK_SIZE, typename Loader>
 static __global__ void top_k_radix_gather(
-        const float * __restrict__ src,
+        const Loader ld,
         int * __restrict__ dst,
         top_k_radix_state * __restrict__ states,
         int ncols,
@@ -257,14 +258,13 @@ static __global__ void top_k_radix_gather(
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
-    const float * row_src = src + (size_t) row * ncols;
     int * row_dst = dst + (size_t) row * k;
     top_k_radix_state * state = &states[row];
 
     for (int col = row_block * BLOCK_SIZE + tid;
          col < ncols;
          col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        const uint32_t key = top_k_float_to_ordered(ld(row, col));
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
@@ -277,9 +277,10 @@ static __global__ void top_k_radix_gather(
     }
 }
 
-static void top_k_radix_cuda(
+template<typename Loader>
+static void top_k_radix_cuda_ld(
         ggml_cuda_pool & pool,
-        const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+        const Loader ld, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
@@ -296,7 +297,7 @@ static void top_k_radix_cuda(
     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
         top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-                src, states, histograms, ncols, blocks_per_row, shift);
+                ld, states, histograms, ncols, blocks_per_row, shift);
         top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
     }
@@ -305,19 +306,69 @@ static void top_k_radix_cuda(
         <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, dst, states, ncols, k, blocks_per_row);
+            ld, dst, states, ncols, k, blocks_per_row);
 }
 
-#endif // Batched radix selection: CUDA with DeviceTopK, or HIP without CUB.
+
+template<typename T>
+struct top_k_load_plain {
+    const T * src;
+    int       ncols;
+    __device__ __forceinline__ float operator()(int row, int col) const {
+        return (float) src[(size_t) row * ncols + col];
+    }
+};
+
+template<typename T>
+static void top_k_radix_cuda(
+        ggml_cuda_pool & pool,
+        const T * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    top_k_radix_cuda_ld(pool, top_k_load_plain<T>{src, ncols}, dst, ncols, nrows, k, stream);
+}
+
+// qwen4exp QSA router: cell value = score[block of cell] + mask[cell]; rows are (token, stream)
+template<typename M>
+struct top_k_load_qsa {
+    const float   * score;    // [n_blocks, n_tps, n_stream]
+    const int32_t * cell_blk; // [n_kv, n_stream]
+    const M       * mask;     // [n_kv, n_tps, 1, n_stream]
+    int n_kv;
+    int n_blocks;
+    int n_tps;
+    __device__ __forceinline__ float operator()(int row, int col) const {
+        const int s = row / n_tps;
+        return score[(size_t) row * n_blocks + cell_blk[(size_t) s * n_kv + col]] + (float) mask[(size_t) row * n_kv + col];
+    }
+};
+
+void ggml_cuda_op_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * score    = dst->src[0];
+    const ggml_tensor * cell_blk = dst->src[1];
+    const ggml_tensor * mask     = dst->src[2];
+
+    const int n_kv     = (int) cell_blk->ne[0];
+    const int n_blocks = (int) score->ne[0];
+    const int n_tps    = (int) score->ne[1];
+    const int nrows    = (int) (score->ne[1] * score->ne[2]);
+    const int k        = (int) dst->ne[0];
+
+    if (mask->type == GGML_TYPE_F16) {
+        const top_k_load_qsa<half> ld{(const float *) score->data, (const int32_t *) cell_blk->data,
+                                      (const half *) mask->data, n_kv, n_blocks, n_tps};
+        top_k_radix_cuda_ld(ctx.pool(), ld, (int *) dst->data, n_kv, nrows, k, ctx.stream());
+    } else {
+        const top_k_load_qsa<float> ld{(const float *) score->data, (const int32_t *) cell_blk->data,
+                                       (const float *) mask->data, n_kv, n_blocks, n_tps};
+        top_k_radix_cuda_ld(ctx.pool(), ld, (int *) dst->data, n_kv, nrows, k, ctx.stream());
+    }
+}
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
-    const float *       src0_d = (const float *) src0->data;
     int *               dst_d  = (int *) dst->data;
     cudaStream_t        stream = ctx.stream();
 
-    // are these asserts truly necessary?
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(src0));
 
@@ -327,6 +378,21 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool       stable = ggml_top_k_is_stable(dst);
     ggml_cuda_pool & pool  = ctx.pool();
     GGML_ASSERT(!stable || k <= 64);
+
+    // F16 scores keep their half width through the selection: the radix keys are built from the exact f32 value
+    // TODO: only tested on HIP (gfx1201); on CUDA this replaces the f32 copy + DeviceTopK, needs a correctness and speed check
+    if (src0->type == GGML_TYPE_F16 && ncols > 1024 && !stable) {
+        top_k_radix_cuda(pool, (const half *) src0->data, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+    ggml_cuda_pool_alloc<float> src0_f32(pool);
+    const float * src0_d = (const float *) src0->data;
+    if (src0->type == GGML_TYPE_F16) {
+        src0_f32.alloc(ggml_nelements(src0));
+        ggml_get_to_fp32_cuda(GGML_TYPE_F16)(src0->data, src0_f32.get(), ggml_nelements(src0), stream);
+        src0_d = src0_f32.get();
+    }
+    const float * src0_f32_base = src0_d;
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
@@ -386,10 +452,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_cuda_pool_alloc<int> tie_ids_alloc(pool, n_work * k);
         ggml_cuda_pool_alloc<int> tie_counts_alloc(pool, n_work);
         stable_top_k_collect_ties<<<n_work, WARP_SIZE, 0, stream>>>(
-                (const float *) src0->data, (const int *) dst->data,
+                src0_f32_base, (const int *) dst->data,
                 tie_ids_alloc.get(), tie_counts_alloc.get(), ncols, k, n_chunks);
         stable_top_k_finalize<<<nrows, 1, 0, stream>>>(
-                (const float *) src0->data, (int *) dst->data,
+                src0_f32_base, (int *) dst->data,
                 tie_ids_alloc.get(), tie_counts_alloc.get(), ncols, k, n_chunks);
     }
 }
