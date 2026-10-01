@@ -1021,9 +1021,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
 
     if (blk_bias) {
-        // flash attention keeps the mask in f16; the scores are f32
+        // flash attention keeps the mask in f16; the scores are f32.
+        // Add the mask input itself, shaped like it: a per-layer view of a graph input makes the scheduler upload a
+        // separate n_kv x n_tokens copy for every QSA layer, and those copies stay live for the whole graph.
         ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-        expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
+        expanded = ggml_reshape_4d(ctx0, expanded, n_kv, n_tps, 1, n_stream);
+        expanded = ggml_add(ctx0, expanded, mask);
     } else {
         expanded = ggml_add(ctx0, expanded, inp->bias);
     }
