@@ -8555,11 +8555,13 @@ struct test_top_k_qsa_op : public test_case {
     const int       k;
     const ggml_type mask_type;
     const bool      shuffled; // cells not in position order (cell_blk not monotonic)
+    static constexpr int64_t r = 4;
     ggml_tensor * score {};
     ggml_tensor * cell_blk {};
     ggml_tensor * mask {};
     ggml_tensor * blk_bias {};
     ggml_tensor * blk_thr {};
+    ggml_tensor * blk_cells {};
 
     std::string vars() override {
         return VARS_TO_STR6(n_kv, n_tps, n_stream, k, mask_type, shuffled);
@@ -8571,48 +8573,82 @@ struct test_top_k_qsa_op : public test_case {
 
     double max_err() override { return 0.0; }
 
-    // ties are the norm (four cells share a block score), so compare the selected values, not indices
+    // blocks are distinct, but the cells filling unused slots are any the mask hides: compare canonically
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t n_blocks = (n_kv + 3) / 4;
-        score    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
-        cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
-        mask     = ggml_new_tensor_4d(ctx, mask_type, n_kv, n_tps, 1, n_stream);
-        blk_bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 2, n_stream);
-        blk_thr  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tps, n_stream);
+        const int64_t n_blocks = (n_kv + r - 1) / r;
+        score     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+        cell_blk  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        mask      = ggml_new_tensor_4d(ctx, mask_type, n_kv, n_tps, 1, n_stream);
+        blk_bias  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 2, n_stream);
+        blk_thr   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tps, n_stream);
+        blk_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r * n_blocks, n_stream);
         ggml_set_name(score, "score");
         ggml_set_name(cell_blk, "cell_blk");
         ggml_set_name(mask, "mask");
         ggml_set_name(blk_bias, "blk_bias");
         ggml_set_name(blk_thr, "blk_thr");
-        ggml_tensor * out = ggml_top_k_qsa(ctx, score, cell_blk, mask, blk_bias, blk_thr, k);
+        ggml_set_name(blk_cells, "blk_cells");
+        ggml_tensor * out = ggml_top_k_qsa(ctx, score, cell_blk, mask, blk_bias, blk_thr, blk_cells, k);
         ggml_set_name(out, "out");
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         std::mt19937 rng(1234);
-        const int64_t n_blocks = (n_kv + 3) / 4;
+        const int64_t n_blocks = (n_kv + r - 1) / r;
         {
+            // distinct block scores per row, so the selected blocks are unique
             std::vector<float> v(ggml_nelements(score));
-            std::uniform_int_distribution<int> d(0, 999);
-            for (auto & x : v) x = d(rng) * 0.5f; // coarse values: ties across blocks too
+            std::vector<float> perm(n_blocks);
+            for (int64_t b = 0; b < n_blocks; ++b) perm[b] = (float) b * 0.25f;
+            for (int64_t row = 0; row < n_tps * n_stream; ++row) {
+                std::shuffle(perm.begin(), perm.end(), rng);
+                std::copy(perm.begin(), perm.end(), v.begin() + row * n_blocks);
+            }
             ggml_backend_tensor_set(score, v.data(), 0, ggml_nbytes(score));
         }
+        std::vector<int32_t> cb(n_kv * n_stream);
+        std::vector<int32_t> bcv(r * n_blocks * n_stream, 0);
         {
-            std::vector<int32_t> v(n_kv * n_stream);
             for (int64_t s = 0; s < n_stream; ++s) {
-                for (int64_t j = 0; j < n_kv; ++j) v[s * n_kv + j] = (int32_t) (j / 4);
-                if (shuffled) std::shuffle(v.begin() + s * n_kv, v.begin() + (s + 1) * n_kv, rng);
+                for (int64_t j = 0; j < n_kv; ++j) cb[s * n_kv + j] = (int32_t) (j / r);
+                if (shuffled) std::shuffle(cb.begin() + s * n_kv, cb.begin() + (s + 1) * n_kv, rng);
+                std::vector<int> fill(n_blocks, 0);
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const int32_t b = cb[s * n_kv + j];
+                    bcv[(s * n_blocks + b) * r + fill[b]++] = (int32_t) j;
+                }
             }
-            for (auto & x : v) GGML_ASSERT(x >= 0 && x < n_blocks);
-            ggml_backend_tensor_set(cell_blk, v.data(), 0, ggml_nbytes(cell_blk));
+            for (auto & x : cb) GGML_ASSERT(x >= 0 && x < n_blocks);
+            ggml_backend_tensor_set(cell_blk, cb.data(), 0, ggml_nbytes(cell_blk));
+            ggml_backend_tensor_set(blk_cells, bcv.data(), 0, ggml_nbytes(blk_cells));
         }
+        std::uniform_int_distribution<int> t(1, 8);
+        std::vector<int32_t> thr(ggml_nelements(blk_thr));
+        for (auto & x : thr) x = (int32_t) (n_blocks - t(rng));
         {
-            std::uniform_int_distribution<int> d(0, 3);
+            // like a causal text batch: every cell of a block below the token's tail is visible, at most
+            // r - 1 cells of the tail block are, and later blocks are hidden; some old blocks are hidden too
+            std::uniform_int_distribution<int> d(0, 9);
             std::vector<float> v(ggml_nelements(mask));
-            for (auto & x : v) x = d(rng) == 0 ? -INFINITY : 0.0f;
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t i = 0; i < n_tps; ++i) {
+                    const int64_t row = s * n_tps + i;
+                    const int32_t tail = thr[row];
+                    const int n_tail = (int) (row % r); // 0 .. r - 1 visible tail cells
+                    std::vector<int> seen(n_blocks, 0);
+                    std::vector<char> hidden_blk(n_blocks);
+                    for (auto & h : hidden_blk) h = d(rng) == 0;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        const int32_t b = cb[s * n_kv + j];
+                        const int slot = seen[b]++;
+                        const bool vis = b < tail ? !hidden_blk[b] : (b == tail && slot < n_tail);
+                        v[row * n_kv + j] = vis ? 0.0f : -INFINITY;
+                    }
+                }
+            }
             if (mask_type == GGML_TYPE_F16) {
                 std::vector<ggml_fp16_t> h(v.size());
                 for (size_t i = 0; i < v.size(); ++i) h[i] = ggml_fp32_to_fp16(v[i]);
@@ -8622,34 +8658,31 @@ struct test_top_k_qsa_op : public test_case {
             }
         }
         {
-            // the router's bias: 0 or -inf below a token's step, forced (1e9) or -inf from it on
-            std::uniform_int_distribution<int> d(0, 9);
+            // below the step: 0, or -inf for an old incomplete block; from the step on: forced
+            std::uniform_int_distribution<int> d(0, 19);
             std::vector<float> v(ggml_nelements(blk_bias));
             for (int64_t s = 0; s < n_stream; ++s) {
                 for (int64_t b = 0; b < n_blocks; ++b) {
-                    v[(s*2 + 0)*n_blocks + b] = d(rng) == 0 ? -INFINITY : 0.0f;
-                    v[(s*2 + 1)*n_blocks + b] = d(rng) == 0 ? -INFINITY : 1e9f;
+                    v[(s * 2 + 0) * n_blocks + b] = d(rng) == 0 ? -INFINITY : 0.0f;
+                    v[(s * 2 + 1) * n_blocks + b] = 1e9f;
                 }
             }
             ggml_backend_tensor_set(blk_bias, v.data(), 0, ggml_nbytes(blk_bias));
-            std::uniform_int_distribution<int> t(0, 8);
-            std::vector<int32_t> thr(ggml_nelements(blk_thr));
-            for (auto & x : thr) x = (int32_t) (n_blocks - t(rng));
             ggml_backend_tensor_set(blk_thr, thr.data(), 0, ggml_nbytes(blk_thr));
         }
     }
 
     double err(const float * a, const float * b, size_t n) override {
-        const int64_t n_blocks = (n_kv + 3) / 4;
+        const int64_t n_blocks = (n_kv + r - 1) / r;
         const int64_t nr = n_tps * n_stream;
         GGML_ASSERT(n == (size_t) (nr * k));
         std::vector<float> sc(ggml_nelements(score));
         std::vector<int32_t> cb(ggml_nelements(cell_blk));
         std::vector<float> m(ggml_nelements(mask));
-        ggml_backend_tensor_get(score, sc.data(), 0, ggml_nbytes(score));
-        ggml_backend_tensor_get(cell_blk, cb.data(), 0, ggml_nbytes(cell_blk));
         std::vector<float> bb(ggml_nelements(blk_bias));
         std::vector<int32_t> th(ggml_nelements(blk_thr));
+        ggml_backend_tensor_get(score, sc.data(), 0, ggml_nbytes(score));
+        ggml_backend_tensor_get(cell_blk, cb.data(), 0, ggml_nbytes(cell_blk));
         ggml_backend_tensor_get(blk_bias, bb.data(), 0, ggml_nbytes(blk_bias));
         ggml_backend_tensor_get(blk_thr, th.data(), 0, ggml_nbytes(blk_thr));
         if (mask_type == GGML_TYPE_F16) {
@@ -8659,28 +8692,33 @@ struct test_top_k_qsa_op : public test_case {
         } else {
             ggml_backend_tensor_get(mask, m.data(), 0, ggml_nbytes(mask));
         }
-        auto value = [&](int64_t r, int32_t c) {
-            const int64_t s = r / n_tps;
+        // a visible cell counts with its block value, a hidden one as -inf; visible cells must not repeat
+        auto value = [&](int64_t row, int32_t c) {
+            const int64_t s = row / n_tps;
             const int32_t blk = cb[s * n_kv + c];
-            return (sc[r * n_blocks + blk] + bb[(s * 2 + (blk >= th[r])) * n_blocks + blk]) + m[r * n_kv + c];
+            if (m[row * n_kv + c] == -INFINITY) return -INFINITY;
+            return sc[row * n_blocks + blk] + bb[(s * 2 + (blk >= th[row])) * n_blocks + blk];
         };
         double diff = 0.0;
         std::vector<float> va(k), vb(k);
-        std::vector<int32_t> ia(k), ib(k);
-        for (int64_t r = 0; r < nr; ++r) {
+        std::vector<int32_t> ia, ib;
+        for (int64_t row = 0; row < nr; ++row) {
+            ia.clear(); ib.clear();
             for (int c = 0; c < k; ++c) {
-                ia[c] = (int32_t) a[r * k + c];
-                ib[c] = (int32_t) b[r * k + c];
-                if (ia[c] < 0 || ia[c] >= n_kv || ib[c] < 0 || ib[c] >= n_kv) {
+                const int32_t xa = (int32_t) a[row * k + c];
+                const int32_t xb = (int32_t) b[row * k + c];
+                if (xa < 0 || xa >= n_kv || xb < 0 || xb >= n_kv) {
                     return 1e9;
                 }
-                va[c] = value(r, ia[c]);
-                vb[c] = value(r, ib[c]);
+                va[c] = value(row, xa);
+                vb[c] = value(row, xb);
+                if (va[c] != -INFINITY) ia.push_back(xa);
+                if (vb[c] != -INFINITY) ib.push_back(xb);
             }
             std::sort(va.begin(), va.end());
             std::sort(vb.begin(), vb.end());
             for (int c = 0; c < k; ++c) {
-                diff += va[c] == vb[c] || (std::isinf(va[c]) && va[c] == vb[c]) ? 0.0 : 1.0;
+                diff += va[c] == vb[c] ? 0.0 : 1.0;
             }
             std::sort(ia.begin(), ia.end());
             std::sort(ib.begin(), ib.end());
@@ -12848,7 +12886,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int64_t n_kv : {4096, 34816, 262144}) {
-        for (int k : {32, 2051}) {
+        for (int k : {35, 2051}) {
             test_cases.emplace_back(new test_top_k_qsa_op(n_kv, 16, 1, k, GGML_TYPE_F16, false));
         }
         test_cases.emplace_back(new test_top_k_qsa_op(n_kv, 8, 2, 2051, GGML_TYPE_F16, true));

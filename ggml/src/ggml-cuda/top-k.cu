@@ -326,46 +326,138 @@ static void top_k_radix_cuda(
     top_k_radix_cuda_ld(pool, top_k_load_plain<T>{src, ncols}, dst, ncols, nrows, k, stream);
 }
 
-// qwen4exp QSA router: cell value = score[b] + bias[b] + mask[cell], b = block of cell; rows are (token, stream)
-template<typename M>
-struct top_k_load_qsa {
-    const float   * score;    // [n_blocks, n_tps, n_stream]
-    const int32_t * cell_blk; // [n_kv, n_stream]
-    const M       * mask;     // [n_kv, n_tps, 1, n_stream]
-    const float   * blk_bias; // [n_blocks, 2, n_stream]: below / at or above the token's threshold
-    const int32_t * blk_thr;  // [n_tps, n_stream]
+// qwen4exp QSA router, as the reference indexer selects: per token (row), block b has the value
+// score[b] + bias[b]; forced blocks (>= 5e8) give their visible cells, the best nb other finite blocks give
+// all their cells, and the slots left over get cells the token's mask hides.
+struct top_k_qsa_args {
+    const float   * score;     // [n_blocks, n_tps, n_stream]
+    const int32_t * cell_blk;  // [n_kv, n_stream]
+    const float   * blk_bias;  // [n_blocks, 2, n_stream]: below / at or above the token's threshold
+    const int32_t * blk_thr;   // [n_tps, n_stream]
+    const int32_t * blk_cells; // [r*n_blocks, n_stream]
     int n_kv;
     int n_blocks;
     int n_tps;
-    __device__ __forceinline__ float operator()(int row, int col) const {
+    int r;
+
+    __device__ __forceinline__ float block_value(int row, int b) const {
         const int s = row / n_tps;
-        const int b = cell_blk[(size_t) s * n_kv + col];
-        const float bias = blk_bias[((size_t) s * 2 + (b >= blk_thr[row])) * n_blocks + b];
-        return (score[(size_t) row * n_blocks + b] + bias) + (float) mask[(size_t) row * n_kv + col];
+        return score[(size_t) row * n_blocks + b] + blk_bias[((size_t) s * 2 + (b >= blk_thr[row])) * n_blocks + b];
     }
 };
+
+// candidate blocks for the radix select: finite and not forced, others -inf
+struct top_k_load_qsa_blocks {
+    top_k_qsa_args a;
+    __device__ __forceinline__ float operator()(int row, int b) const {
+        const float v = a.block_value(row, b);
+        return isfinite(v) && v < 5e8f ? v : -INFINITY;
+    }
+};
+
+template<typename M>
+static __global__ void top_k_qsa_assemble(
+        const top_k_qsa_args a, const M * __restrict__ mask, const int * __restrict__ sel,
+        int * __restrict__ dst, int k, int nb) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int s   = row / a.n_tps;
+    const int32_t * blk = a.cell_blk  + (size_t) s * a.n_kv;
+    const int32_t * bc  = a.blk_cells + (size_t) s * a.r * a.n_blocks;
+    const M       * m   = mask        + (size_t) row * a.n_kv;
+    int           * out = dst         + (size_t) row * k;
+
+    __shared__ int n_out;
+    if (tid == 0) {
+        n_out = 0;
+    }
+    __syncthreads();
+
+    // the forced tail: the cells of forced blocks that the token sees
+    for (int b = tid; b < a.n_blocks; b += blockDim.x) {
+        if (!(a.block_value(row, b) >= 5e8f)) {
+            continue;
+        }
+        for (int slot = 0; slot < a.r; ++slot) {
+            const int32_t cell = bc[(size_t) b * a.r + slot];
+            // empty slots point at a cell of another block, or repeat one of this block
+            bool skip = blk[cell] != b;
+            for (int prev = 0; prev < slot && !skip; ++prev) {
+                skip = bc[(size_t) b * a.r + prev] == cell;
+            }
+            if (!skip && (float) m[cell] != -INFINITY) {
+                const int p = atomicAdd(&n_out, 1);
+                if (p < k) {
+                    out[p] = cell;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const int n_forced = min(n_out, k);
+    // ponytail: a forced tail longer than r - 1 cells (not seen in causal text) drops arbitrary blocks
+    const int nb_eff = min(nb, (k - n_forced) / a.r);
+    __syncthreads();
+    if (tid == 0) {
+        n_out = n_forced;
+    }
+    __syncthreads();
+
+    // the best whole blocks; a -inf pick means fewer candidates than the budget
+    for (int i = tid; i < nb_eff; i += blockDim.x) {
+        const int b = sel[(size_t) row * nb + i];
+        if (a.block_value(row, b) == -INFINITY || !(a.block_value(row, b) < 5e8f)) {
+            continue;
+        }
+        const int p = atomicAdd(&n_out, a.r);
+        for (int slot = 0; slot < a.r; ++slot) {
+            out[p + slot] = bc[(size_t) b * a.r + slot];
+        }
+    }
+    __syncthreads();
+
+    // the reference marks the rest invalid: point it at cells the token cannot see, newest first
+    for (int j = a.n_kv - 1 - tid; j >= 0; j -= blockDim.x) {
+        if (*(volatile int *) &n_out >= k) {
+            break;
+        }
+        if ((float) m[j] == -INFINITY) {
+            const int p = atomicAdd(&n_out, 1);
+            if (p < k) {
+                out[p] = j;
+            }
+        }
+    }
+    __syncthreads();
+    // ponytail: a row that sees every cell repeats one; the gather path then counts it twice
+    for (int p = n_out + tid; p < k; p += blockDim.x) {
+        out[p] = out[0];
+    }
+}
 
 void ggml_cuda_op_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * score    = dst->src[0];
     const ggml_tensor * cell_blk = dst->src[1];
     const ggml_tensor * mask     = dst->src[2];
-    const float   * blk_bias = (const float   *) dst->src[3]->data;
-    const int32_t * blk_thr  = (const int32_t *) dst->src[4]->data;
 
     const int n_kv     = (int) cell_blk->ne[0];
     const int n_blocks = (int) score->ne[0];
-    const int n_tps    = (int) score->ne[1];
     const int nrows    = (int) (score->ne[1] * score->ne[2]);
     const int k        = (int) dst->ne[0];
+    const int r        = (int) (dst->src[5]->ne[0] / n_blocks);
+    const int nb       = (k - (r - 1)) / r;
+
+    const top_k_qsa_args a{(const float *) score->data, (const int32_t *) cell_blk->data,
+                           (const float *) dst->src[3]->data, (const int32_t *) dst->src[4]->data,
+                           (const int32_t *) dst->src[5]->data, n_kv, n_blocks, (int) score->ne[1], r};
+
+    ggml_cuda_pool_alloc<int> sel(ctx.pool(), (size_t) nrows * nb);
+    top_k_radix_cuda_ld(ctx.pool(), top_k_load_qsa_blocks{a}, sel.get(), n_blocks, nrows, nb, ctx.stream());
 
     if (mask->type == GGML_TYPE_F16) {
-        const top_k_load_qsa<half> ld{(const float *) score->data, (const int32_t *) cell_blk->data,
-                                      (const half *) mask->data, blk_bias, blk_thr, n_kv, n_blocks, n_tps};
-        top_k_radix_cuda_ld(ctx.pool(), ld, (int *) dst->data, n_kv, nrows, k, ctx.stream());
+        top_k_qsa_assemble<<<nrows, 256, 0, ctx.stream()>>>(a, (const half *) mask->data, sel.get(), (int *) dst->data, k, nb);
     } else {
-        const top_k_load_qsa<float> ld{(const float *) score->data, (const int32_t *) cell_blk->data,
-                                       (const float *) mask->data, blk_bias, blk_thr, n_kv, n_blocks, n_tps};
-        top_k_radix_cuda_ld(ctx.pool(), ld, (int *) dst->data, n_kv, nrows, k, ctx.stream());
+        top_k_qsa_assemble<<<nrows, 256, 0, ctx.stream()>>>(a, (const float *) mask->data, sel.get(), (int *) dst->data, k, nb);
     }
 }
 

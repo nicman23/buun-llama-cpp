@@ -2637,15 +2637,19 @@ extern "C" {
             int                   k,
             bool                  stable);
 
-    // top-k over KV cells whose value is score[b] + bias[b] + mask[cell], b = cell_blk[cell], without
-    // materializing the n_kv x n_tokens values (the qwen4exp QSA router: one indexer score per block of
-    // cells). The per-block bias of a token is blk_bias[b, 1] for b >= blk_thr[token], else blk_bias[b, 0].
-    //   score:    [n_blocks, n_tps, n_stream]      f32
-    //   cell_blk: [n_kv,     n_stream]             i32, block of each cell, in [0, n_blocks)
-    //   mask:     [n_kv,     n_tps, 1, n_stream]   f16 or f32
-    //   blk_bias: [n_blocks, 2, n_stream]          f32, bias below / at or above the token's threshold
-    //   blk_thr:  [n_tps,    n_stream]             i32, first block of the token's upper bias
-    //   result:   [k,        n_tps, n_stream]      i32, indices of the k largest cells (unordered)
+    // the qwen4exp QSA router's selection, as the reference indexer does it, without materializing the
+    // n_kv x n_tokens cell values. Per token, block b has the value score[b] + bias[b], where bias[b] is
+    // blk_bias[b, 1] for b >= blk_thr[token], else blk_bias[b, 0]. A block of value >= 5e8 is forced: its
+    // cells that the token can see (finite mask) come first. Then the (k - (r - 1))/r best blocks of finite
+    // value, r = blk_cells->ne[0]/n_blocks, expanded to all r of their cells. Slots left over hold cells the
+    // mask hides from the token, so they add nothing to the attention.
+    //   score:     [n_blocks,   n_tps, n_stream]     f32
+    //   cell_blk:  [n_kv,       n_stream]            i32, block of each cell, in [0, n_blocks)
+    //   mask:      [n_kv,       n_tps, 1, n_stream]  f16 or f32
+    //   blk_bias:  [n_blocks,   2, n_stream]         f32, bias below / at or above the token's threshold
+    //   blk_thr:   [n_tps,      n_stream]            i32, first block of the token's upper bias
+    //   blk_cells: [r*n_blocks, n_stream]            i32, the cells of each block
+    //   result:    [k,          n_tps, n_stream]     i32, selected cells (unordered)
     GGML_API struct ggml_tensor * ggml_top_k_qsa(
             struct ggml_context * ctx,
             struct ggml_tensor  * score,
@@ -2653,6 +2657,7 @@ extern "C" {
             struct ggml_tensor  * mask,
             struct ggml_tensor  * blk_bias,
             struct ggml_tensor  * blk_thr,
+            struct ggml_tensor  * blk_cells,
             int                   k);
 
     GGML_API bool ggml_top_k_is_stable(const struct ggml_tensor * tensor);

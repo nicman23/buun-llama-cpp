@@ -8689,60 +8689,97 @@ void ggml_compute_forward_top_k_qsa(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
 
-    const ggml_tensor * score    = dst->src[0]; // [n_blocks, n_tps, n_stream] f32
-    const ggml_tensor * cell_blk = dst->src[1]; // [n_kv, n_stream] i32
-    const ggml_tensor * mask     = dst->src[2]; // [n_kv, n_tps, 1, n_stream] f16/f32
-    const ggml_tensor * blk_bias = dst->src[3]; // [n_blocks, 2, n_stream] f32
-    const ggml_tensor * blk_thr  = dst->src[4]; // [n_tps, n_stream] i32
+    const ggml_tensor * score     = dst->src[0]; // [n_blocks, n_tps, n_stream] f32
+    const ggml_tensor * cell_blk  = dst->src[1]; // [n_kv, n_stream] i32
+    const ggml_tensor * mask      = dst->src[2]; // [n_kv, n_tps, 1, n_stream] f16/f32
+    const ggml_tensor * blk_bias  = dst->src[3]; // [n_blocks, 2, n_stream] f32
+    const ggml_tensor * blk_thr   = dst->src[4]; // [n_tps, n_stream] i32
+    const ggml_tensor * blk_cells = dst->src[5]; // [r*n_blocks, n_stream] i32
 
     const int64_t n_blocks = score->ne[0];
     const int64_t n_tps    = score->ne[1];
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t nr       = n_tps*score->ne[2];
+    const int64_t r        = blk_cells->ne[0]/n_blocks;
     const int     top_k    = dst->ne[0];
+    const int     nb       = (top_k - (r - 1))/r; // blocks in the budget
 
     const int ith = params->ith;
     const int nth = params->nth;
 
     int32_t * tmp = (int32_t *) params->wdata + (n_kv + CACHE_LINE_SIZE_F32) * ith;
-    std::vector<float> row(n_kv);
     std::vector<float> row_sample;
-    std::vector<float> sc(n_blocks);
+    std::vector<float> v(n_blocks);  // block values
+    std::vector<float> cv(n_blocks); // candidate block values: -inf unless finite and not forced
 
-    for (int64_t r = ith; r < nr; r += nth) {
-        const int64_t s = r / n_tps;
-        const float   * sc_raw = (const float *) score->data + r*n_blocks;
-        const float   * bias   = (const float *) blk_bias->data + s*2*n_blocks;
-        const int32_t   thr    = ((const int32_t *) blk_thr->data)[r];
-        const int32_t * blk    = (const int32_t *) cell_blk->data + s*n_kv;
+    for (int64_t row = ith; row < nr; row += nth) {
+        const int64_t s = row / n_tps;
+        const float   * sc   = (const float *) score->data + row*n_blocks;
+        const float   * bias = (const float *) blk_bias->data + s*2*n_blocks;
+        const int32_t   thr  = ((const int32_t *) blk_thr->data)[row];
+        const int32_t * blk  = (const int32_t *) cell_blk->data + s*n_kv;
+        const int32_t * bc   = (const int32_t *) blk_cells->data + s*r*n_blocks;
+        int32_t       * out  = (int32_t *) dst->data + row*top_k;
+
+        const auto visible = [&](int32_t cell) {
+            return mask->type == GGML_TYPE_F16 ?
+                GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mask->data)[row*n_kv + cell]) != -INFINITY :
+                ((const float *) mask->data)[row*n_kv + cell] != -INFINITY;
+        };
+
         for (int64_t b = 0; b < n_blocks; ++b) {
-            sc[b] = sc_raw[b] + bias[(b >= thr)*n_blocks + b];
+            v[b]  = sc[b] + bias[(b >= thr)*n_blocks + b];
+            cv[b] = std::isfinite(v[b]) && v[b] < 5e8f ? v[b] : -INFINITY;
         }
-        if (mask->type == GGML_TYPE_F16) {
-            const ggml_fp16_t * m = (const ggml_fp16_t *) mask->data + r*n_kv;
-            for (int64_t j = 0; j < n_kv; ++j) {
-                row[j] = sc[blk[j]] + GGML_CPU_FP16_TO_FP32(m[j]);
+
+        // the forced tail first: the cells of forced blocks that the token sees
+        int n_out = 0;
+        for (int64_t b = 0; b < n_blocks && n_out < top_k; ++b) {
+            if (!(v[b] >= 5e8f)) {
+                continue;
             }
-        } else {
-            const float * m = (const float *) mask->data + r*n_kv;
-            for (int64_t j = 0; j < n_kv; ++j) {
-                row[j] = sc[blk[j]] + m[j];
+            for (int64_t slot = 0; slot < r && n_out < top_k; ++slot) {
+                const int32_t cell = bc[b*r + slot];
+                // empty slots point at a cell of another block, or repeat one of this block
+                if (blk[cell] != b || std::find(bc + b*r, bc + b*r + slot, cell) != bc + b*r + slot) {
+                    continue;
+                }
+                if (visible(cell)) {
+                    out[n_out++] = cell;
+                }
             }
         }
 
+        // then the best whole blocks
+        const int nb_eff = std::min<int>(nb, (top_k - n_out)/r);
         int64_t n_cand = 0;
-        if (n_kv >= 4096 && n_kv >= 8*(int64_t) top_k) {
-            n_cand = top_k_filter(row.data(), n_kv, top_k_threshold(row.data(), n_kv, top_k, row_sample), tmp);
+        if (n_blocks >= 4096 && n_blocks >= 8*(int64_t) nb_eff && nb_eff > 0) {
+            n_cand = top_k_filter(cv.data(), n_blocks, top_k_threshold(cv.data(), n_blocks, nb_eff, row_sample), tmp);
         }
-        if (n_cand >= top_k) {
-            std::partial_sort(tmp, tmp + top_k, tmp + n_cand, cmp_top_k{row.data(), false});
+        if (n_cand >= nb_eff) {
+            std::partial_sort(tmp, tmp + nb_eff, tmp + n_cand, cmp_top_k{cv.data(), false});
         } else {
-            for (int64_t j = 0; j < n_kv; ++j) {
-                tmp[j] = j;
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                tmp[b] = b;
             }
-            std::partial_sort(tmp, tmp + top_k, tmp + n_kv, cmp_top_k{row.data(), false});
+            std::partial_sort(tmp, tmp + nb_eff, tmp + n_blocks, cmp_top_k{cv.data(), false});
         }
-        std::copy(tmp, tmp + top_k, (int32_t *) dst->data + r*top_k);
+        for (int i = 0; i < nb_eff && cv[tmp[i]] != -INFINITY; ++i) {
+            for (int64_t slot = 0; slot < r; ++slot) {
+                out[n_out++] = bc[tmp[i]*r + slot];
+            }
+        }
+
+        // the reference marks the rest invalid: point it at cells the token cannot see
+        for (int64_t j = n_kv - 1; j >= 0 && n_out < top_k; --j) {
+            if (!visible((int32_t) j)) {
+                out[n_out++] = (int32_t) j;
+            }
+        }
+        // ponytail: a row that sees every cell repeats one; the gather path then counts it twice
+        for (int i = n_out; i < top_k; ++i) {
+            out[i] = out[0];
+        }
     }
 }
 

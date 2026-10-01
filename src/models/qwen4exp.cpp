@@ -1024,11 +1024,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     ggml_tensor * top_k;
     if (blk_bias) {
-        // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block
-        // boundary. The fused op reads score[b] + bias[b] + mask[cell] as it selects, so neither the
-        // n_kv x n_tokens cell values (the largest tensors of the long-context compute buffer) nor the
-        // n_blocks x n_tokens bias are materialized.
-        top_k = ggml_top_k_qsa(ctx0, score, inp->cell_blk, kq_mask, inp->bias, inp->blk_thr, width);
+        // As the reference: the best indexer_top_k/ratio whole visible blocks, expanded to their cells, plus
+        // the visible cells of the causal tail; the reference's invalid slots point at cells the mask hides.
+        // The fused op selects over blocks, so neither the n_kv x n_tokens cell values (the largest tensors
+        // of the long-context compute buffer) nor the n_blocks x n_tokens bias are materialized.
+        top_k = ggml_top_k_qsa(ctx0, score, inp->cell_blk, kq_mask, inp->bias, inp->blk_thr, inp->blk_cells, width);
     } else {
         ggml_tensor * expanded = ggml_get_rows(ctx0,
                 ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
