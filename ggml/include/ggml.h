@@ -732,6 +732,7 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET_TREE,
         GGML_OP_SSM_CONV_TREE,
         GGML_OP_TURBO_WHT,
+        GGML_OP_TOP_K_QSA,
 
         GGML_OP_UNARY,
 
@@ -1889,12 +1890,6 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
-    // same as ggml_get_rows, but an F16 source yields an F16 result instead of F32
-    GGML_API struct ggml_tensor * ggml_get_rows_f16(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,  // F16 data
-            struct ggml_tensor  * b); // row indices
-
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
@@ -2641,6 +2636,19 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k,
             bool                  stable);
+
+    // top-k over KV cells whose value is score[cell_blk[cell]] + mask[cell], without materializing the
+    // n_kv x n_tokens values (the qwen4exp QSA router: one indexer score per block of cells)
+    //   score:    [n_blocks, n_tps, n_stream]      f32
+    //   cell_blk: [n_kv,     n_stream]             i32, block of each cell, in [0, n_blocks)
+    //   mask:     [n_kv,     n_tps, 1, n_stream]   f16 or f32
+    //   result:   [k,        n_tps, n_stream]      i32, indices of the k largest cells (unordered)
+    GGML_API struct ggml_tensor * ggml_top_k_qsa(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * cell_blk,
+            struct ggml_tensor  * mask,
+            int                   k);
 
     GGML_API bool ggml_top_k_is_stable(const struct ggml_tensor * tensor);
 

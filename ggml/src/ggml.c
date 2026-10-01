@@ -1438,6 +1438,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET_TREE",
     "SSM_CONV_TREE",
     "TURBO_WHT",
+    "TOP_K_QSA",
 
     "UNARY",
 
@@ -1455,7 +1456,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1558,6 +1559,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_delta_net_tree(q, k, v, g, beta, s)",
     "ssm_conv_tree(x)",
     "turbo_wht(a)",
+    "top_k_qsa(x)",
 
     "unary(x)",
 
@@ -1575,7 +1577,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4387,22 +4389,6 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
-struct ggml_tensor * ggml_get_rows_f16(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
-    GGML_ASSERT(a->type == GGML_TYPE_F16);
-
-    struct ggml_tensor * result = ggml_get_rows(ctx, a, b);
-    result->type  = GGML_TYPE_F16;
-    result->nb[0] = ggml_type_size(GGML_TYPE_F16);
-    result->nb[1] = result->nb[0]*result->ne[0];
-    result->nb[2] = result->nb[1]*result->ne[1];
-    result->nb[3] = result->nb[2]*result->ne[2];
-
-    return result;
-}
-
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(
@@ -5905,6 +5891,33 @@ struct ggml_tensor * ggml_top_k_ext(
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
     ggml_set_op_params_i32(result, 0, stable ? 1 : 0);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_top_k_qsa(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * cell_blk,
+        struct ggml_tensor  * mask,
+        int                   k) {
+    GGML_ASSERT(score->type == GGML_TYPE_F32 && cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(score) && ggml_is_contiguous(cell_blk) && ggml_is_contiguous(mask));
+
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_stream = score->ne[2];
+    GGML_ASSERT(score->ne[3] == 1 && cell_blk->ne[1] == n_stream && cell_blk->ne[2] == 1 && cell_blk->ne[3] == 1);
+    GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[1] == n_tps && mask->ne[2] == 1 && mask->ne[3] == n_stream);
+    GGML_ASSERT(k > 0 && k <= n_kv);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k, n_tps, n_stream);
+
+    result->op     = GGML_OP_TOP_K_QSA;
+    result->src[0] = score;
+    result->src[1] = cell_blk;
+    result->src[2] = mask;
 
     return result;
 }
