@@ -4387,6 +4387,22 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_get_rows_f16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F16);
+
+    struct ggml_tensor * result = ggml_get_rows(ctx, a, b);
+    result->type  = GGML_TYPE_F16;
+    result->nb[0] = ggml_type_size(GGML_TYPE_F16);
+    result->nb[1] = result->nb[0]*result->ne[0];
+    result->nb[2] = result->nb[1]*result->ne[1];
+    result->nb[3] = result->nb[2]*result->ne[2];
+
+    return result;
+}
+
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(

@@ -996,7 +996,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
             ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
+    score = ggml_relu_inplace(ctx0, score); // n_kv x n_tokens f32; nothing else reads the unrectified score
 
     // The heads sit side by side on ne[1] and there are few of them, so summing slices avoids
     // transposing the entire block-by-token surface twice.
@@ -1016,18 +1016,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
-    ggml_tensor * expanded = ggml_get_rows(ctx0,
-            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
-    expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-
+    ggml_tensor * expanded;
     if (blk_bias) {
-        // flash attention keeps the mask in f16; the scores are f32.
+        // The cell surfaces below are n_kv x n_tokens, the largest tensors of the long-context compute buffer,
+        // so carry them in f16 with the f16 mask flash attention already keeps. f16 is safe for ranking
+        // (the reference indexer scores in fp8); clamp first so the forced-tail 1e9 cannot become +inf and
+        // turn into NaN against a masked cell. ponytail: assumes real indexer scores stay below 6e4.
+        score = ggml_clamp(ctx0, score, -INFINITY, 6e4f);
+        score = ggml_cast(ctx0, score, GGML_TYPE_F16);
+        expanded = ggml_get_rows_f16(ctx0,
+                ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
+        expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
+
         // Add the mask input itself, shaped like it: a per-layer view of a graph input makes the scheduler upload a
         // separate n_kv x n_tokens copy for every QSA layer, and those copies stay live for the whole graph.
-        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F16 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
         expanded = ggml_reshape_4d(ctx0, expanded, n_kv, n_tps, 1, n_stream);
         expanded = ggml_add(ctx0, expanded, mask);
     } else {
+        expanded = ggml_get_rows(ctx0,
+                ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
+        expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
         expanded = ggml_add(ctx0, expanded, inp->bias);
     }
     cb(expanded, "indexer_score_tokens", il);

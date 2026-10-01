@@ -1,4 +1,5 @@
 #include "argsort.cuh"
+#include "convert.cuh"
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
@@ -171,9 +172,9 @@ static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, i
     }
 }
 
-template<int BLOCK_SIZE, int RADIX_BITS>
+template<int BLOCK_SIZE, int RADIX_BITS, typename T>
 static __global__ void top_k_radix_histogram(
-        const float * __restrict__ src,
+        const T * __restrict__ src,
         const top_k_radix_state * __restrict__ states,
         int * __restrict__ block_histograms,
         int ncols,
@@ -184,7 +185,7 @@ static __global__ void top_k_radix_histogram(
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
-    const float * row_src = src + (size_t) row * ncols;
+    const T * row_src = src + (size_t) row * ncols;
     __shared__ int histogram[NBINS];
 
     histogram[tid] = 0;
@@ -194,7 +195,7 @@ static __global__ void top_k_radix_histogram(
     for (int col = row_block * BLOCK_SIZE + tid;
          col < ncols;
          col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        const uint32_t key = top_k_float_to_ordered((float) row_src[col]);
         if ((key & state.prefix_mask) == state.prefix) {
             atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
         }
@@ -246,9 +247,9 @@ static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, in
     }
 }
 
-template<int BLOCK_SIZE>
+template<int BLOCK_SIZE, typename T>
 static __global__ void top_k_radix_gather(
-        const float * __restrict__ src,
+        const T * __restrict__ src,
         int * __restrict__ dst,
         top_k_radix_state * __restrict__ states,
         int ncols,
@@ -257,14 +258,14 @@ static __global__ void top_k_radix_gather(
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
-    const float * row_src = src + (size_t) row * ncols;
+    const T * row_src = src + (size_t) row * ncols;
     int * row_dst = dst + (size_t) row * k;
     top_k_radix_state * state = &states[row];
 
     for (int col = row_block * BLOCK_SIZE + tid;
          col < ncols;
          col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        const uint32_t key = top_k_float_to_ordered((float) row_src[col]);
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
@@ -277,9 +278,10 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+template<typename T>
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
-        const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+        const T * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
@@ -321,12 +323,10 @@ static __global__ void top_k_copy_rows(const int * __restrict__ src, int * __res
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
-    const float *       src0_d = (const float *) src0->data;
     int *               dst_d  = (int *) dst->data;
     cudaStream_t        stream = ctx.stream();
 
-    // are these asserts truly necessary?
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(src0));
 
@@ -336,6 +336,22 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool       stable = ggml_top_k_is_stable(dst);
     ggml_cuda_pool & pool  = ctx.pool();
     GGML_ASSERT(!stable || k <= 64);
+
+#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+    // F16 scores keep their half width through the selection: the radix keys are built from the exact f32 value
+    if (src0->type == GGML_TYPE_F16 && ncols > 1024 && !stable) {
+        top_k_radix_cuda(pool, (const half *) src0->data, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+#endif
+    ggml_cuda_pool_alloc<float> src0_f32(pool);
+    const float * src0_d = (const float *) src0->data;
+    if (src0->type == GGML_TYPE_F16) {
+        src0_f32.alloc(ggml_nelements(src0));
+        ggml_get_to_fp32_cuda(GGML_TYPE_F16)(src0->data, src0_f32.get(), ggml_nelements(src0), stream);
+        src0_d = src0_f32.get();
+    }
+    const float * src0_f32_base = src0_d;
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
@@ -394,10 +410,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_cuda_pool_alloc<int> tie_ids_alloc(pool, n_work * k);
         ggml_cuda_pool_alloc<int> tie_counts_alloc(pool, n_work);
         stable_top_k_collect_ties<<<n_work, WARP_SIZE, 0, stream>>>(
-                (const float *) src0->data, (const int *) dst->data,
+                src0_f32_base, (const int *) dst->data,
                 tie_ids_alloc.get(), tie_counts_alloc.get(), ncols, k, n_chunks);
         stable_top_k_finalize<<<nrows, 1, 0, stream>>>(
-                (const float *) src0->data, (int *) dst->data,
+                src0_f32_base, (int *) dst->data,
                 tie_ids_alloc.get(), tie_counts_alloc.get(), ncols, k, n_chunks);
     }
 }

@@ -5065,9 +5065,13 @@ static void ggml_compute_forward_get_rows_f16(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
-        ggml_cpu_fp16_to_fp32(
-            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                       (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+        const char * src_row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
+        char       * dst_row = (char       *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3;
+        if (dst->type == GGML_TYPE_F16) {
+            memcpy(dst_row, src_row, nc*sizeof(ggml_fp16_t));
+        } else {
+            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src_row, (float *) dst_row, nc);
+        }
     }
 }
 
@@ -8609,8 +8613,14 @@ static void ggml_compute_forward_top_k_f32(
 
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
+    std::vector<float> row_f32(src0->type == GGML_TYPE_F16 ? ne00 : 0);
+
     for (int64_t i = ith; i < nr; i += nth) {
         const float * src_data = (float *)((char *) src0->data + i*nb01);
+        if (src0->type == GGML_TYPE_F16) {
+            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) ((char *) src0->data + i*nb01), row_f32.data(), ne00);
+            src_data = row_f32.data();
+        }
 
         for (int64_t j = 0; j < ne00; j++) {
             tmp[j] = j;
@@ -8637,6 +8647,7 @@ void ggml_compute_forward_top_k(
 
     switch (src0->type) {
         case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
             {
                 ggml_compute_forward_top_k_f32(params, dst);
             } break;
