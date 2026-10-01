@@ -1124,8 +1124,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
     // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
     kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
 
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+    // combine with the original kq mask, in place: both are n_kv x n_tokens, so a separate sum would hold a
+    // second full mask per QSA layer at the long-context peak of the compute buffer
+    kq_mask_top_k = ggml_add_inplace(ctx0, kq_mask_top_k, kq_mask);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
